@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AGV Demo</title>
+  <style>
+    html,body{margin:0;height:100%;background:#fff;font-family:system-ui,sans-serif;}
+    .wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;}
+    canvas{width:100%;max-width:980px;height:auto;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,.08);}
+    .hud{position:fixed;left:12px;top:12px;background:rgba(255,255,255,.85);backdrop-filter:blur(6px);
+      border:1px solid rgba(0,0,0,.08);border-radius:10px;padding:8px 10px;font-size:12px;color:#111;}
+    kbd{padding:1px 6px;border:1px solid #ccc;border-bottom-width:2px;border-radius:6px;background:#fafafa;}
+  </style>
+</head>
+<body>
+  <div class="hud">
+    Move: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / Arrows • Action: <kbd>E</kbd><br/>
+    Auto-demo after ~8s idle • Click inside the frame to capture keys
+  </div>
+  <div class="wrap">
+    <canvas id="c" width="960" height="540"></canvas>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  // --- SPRITES ---
+  const agvImg = new Image();
+  agvImg.src = "./agv.png";       // put agv.png next to this html file
+
+  const toteImg = new Image();
+  toteImg.src = "./tote.png";     // optional; if missing we draw a box
+
+  // --- UTIL ---
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const len = (v) => Math.hypot(v.x, v.y);
+  const add = (a,b)=>({x:a.x+b.x,y:a.y+b.y});
+  const sub = (a,b)=>({x:a.x-b.x,y:a.y-b.y});
+  const mul = (a,s)=>({x:a.x*s,y:a.y*s});
+  const norm = (v)=>{const l=len(v); return l>1e-6?{x:v.x/l,y:v.y/l}:{x:0,y:0};};
+  const dist2=(a,b)=>{const dx=a.x-b.x,dy=a.y-b.y;return dx*dx+dy*dy;};
+  const wrap=(a)=>{while(a>Math.PI)a-=Math.PI*2;while(a<-Math.PI)a+=Math.PI*2;return a;};
+  const approachAngle=(a,t,maxStep)=>{let d=wrap(t-a); d=clamp(d,-maxStep,maxStep); return wrap(a+d);};
+
+  function circleRectPush(pos, r, rect){
+    const cx = clamp(pos.x, rect.x, rect.x+rect.w);
+    const cy = clamp(pos.y, rect.y, rect.y+rect.h);
+    const dx = pos.x - cx, dy = pos.y - cy;
+    const d = Math.hypot(dx,dy);
+    if (d >= r || d < 1e-6) return {p:pos};
+    const overlap = r - d;
+    const nx = dx/d, ny = dy/d;
+    return { p:{x:pos.x+nx*overlap,y:pos.y+ny*overlap}, n:{x:nx,y:ny} };
+  }
+
+  // --- WORLD ---
+  const W = canvas.width, H = canvas.height;
+
+  const zones = {
+    infeed: { x: 750, y: 150, w: 130, h: 60, label: "Infeed" },
+    robotOutput: { x: 150, y: 430, w: 110, h: 40, label: "Robot output" }
+  };
+
+  const obstacles = [
+    { x: 120, y: 250, w: 640, h: 34, label: "Conveyor" },
+    { x: 90,  y: 360, w: 240, h: 120, label: "Robot cell" }
+  ];
+
+  const conveyorPath = [
+    { x: 815, y: 180 },
+    { x: 520, y: 180 },
+    { x: 520, y: 265 },
+    { x: 260, y: 265 },
+    { x: 210, y: 390 } // robot input
+  ];
+
+  const agvs = [
+    { id:"agv-1", pos:{x:520,y:420}, vel:{x:0,y:0}, angle:0, mode:"manual", carry:null, ai:"seek" },
+    { id:"agv-2", pos:{x:600,y:460}, vel:{x:0,y:0}, angle:0, mode:"auto",   carry:null, ai:"seek" }
+  ];
+  let active = 0;
+
+  const totes = [
+    { id:"tote-1", pos:{x:200,y:450}, state:"AT_ROBOT_OUTPUT", carriedBy:null, seg:0, t:0 },
+    { id:"tote-2", pos:{x:320,y:470}, state:"FLOOR", carriedBy:null, seg:0, t:0 }
+  ];
+
+  const people = [
+    { id:"p1", pos:{x:420,y:120}, vel:{x:30,y:10}, r:16, timer:0 },
+    { id:"p2", pos:{x:660,y:110}, vel:{x:-20,y:25}, r:16, timer:0 }
+  ];
+
+  const robot = { processing:null, timer:0, processTime:1.2, output:{x:200,y:450} };
+
+  // --- INPUT ---
+  const keys = {};
+  let lastInput = performance.now();
+
+  window.addEventListener("keydown",(e)=>{
+    const k = e.key.toLowerCase();
+    keys[k]=true; lastInput=performance.now();
+    if (k==="e") action();
+    if (k==="1") active=0;
+    if (k==="2") active=1;
+    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k)) e.preventDefault();
+  }, {passive:false});
+  window.addEventListener("keyup",(e)=>keys[e.key.toLowerCase()]=false);
+
+  function inRect(p,r){return p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h;}
+
+  function action(){
+    const a = agvs[active];
+    // drop
+    if (a.carry){
+      const t = totes.find(x=>x.id===a.carry);
+      if (!t) return;
+      t.state="FLOOR"; t.carriedBy=null;
+      t.pos = add(a.pos, {x:Math.cos(a.angle)*34, y:Math.sin(a.angle)*34});
+      a.carry=null;
+
+      if (inRect(t.pos, zones.infeed)){
+        t.state="ON_CONVEYOR"; t.seg=0; t.t=0; t.pos={...conveyorPath[0]};
+      }
+      return;
+    }
+    // pick
+    let best=null, bestD=Infinity;
+    for (const t of totes){
+      if (t.state==="ON_CONVEYOR" || t.state==="ROBOT_PROCESSING") continue;
+      if (t.state==="CARRIED") continue;
+      const d = dist2(a.pos, t.pos);
+      if (d < 60*60 && d < bestD){ best=t; bestD=d; }
+    }
+    if (!best) return;
+    best.state="CARRIED"; best.carriedBy=a.id;
+    a.carry=best.id;
+  }
+
+  // --- SIM ---
+  const maxSpeed=220, accel=520, brake=720, turnRate=7.0, agvR=22;
+  const conveyorSpeed=140;
+
+  let last = performance.now();
+  function tick(now){
+    const dt = Math.min(0.033, (now-last)/1000); last=now;
+
+    // auto-demo after idle
+    const idle = (now-lastInput)/1000;
+    if (idle > 8) agvs.forEach(a=>a.mode="auto");
+    else agvs[active].mode="manual";
+
+    // people wander
+    for (const p of people){
+      p.timer += dt;
+      if (p.timer > 1.2){
+        p.timer=0;
+        const ang = Math.random()*Math.PI*2;
+        const sp = 35+Math.random()*25;
+        p.vel = {x:Math.cos(ang)*sp, y:Math.sin(ang)*sp};
+      }
+      p.pos = add(p.pos, mul(p.vel, dt));
+      if (p.pos.x<30||p.pos.x>W-30) p.vel.x*=-1;
+      if (p.pos.y<30||p.pos.y>H-30) p.vel.y*=-1;
+      p.pos.x=clamp(p.pos.x,30,W-30); p.pos.y=clamp(p.pos.y,30,H-30);
+    }
+
+    // conveyor + robot processing
+    for (const t of totes){
+      if (t.state==="CARRIED" && t.carriedBy){
+        const a = agvs.find(x=>x.id===t.carriedBy);
+        if (a){
+          t.pos = add(a.pos, {x:Math.cos(a.angle)*32, y:Math.sin(a.angle)*32});
+        }
+      }
+      if (t.state==="ON_CONVEYOR"){
+        let rem = conveyorSpeed*dt;
+        while (rem>0 && t.seg<conveyorPath.length-1){
+          const A=conveyorPath[t.seg], B=conveyorPath[t.seg+1];
+          const d=sub(B,A); const L=Math.hypot(d.x,d.y);
+          const left=L*(1-t.t);
+          if (rem>=left){
+            t.t=1; t.pos={...B}; rem-=left; t.seg++; t.t=0;
+          } else {
+            const dT = rem/L; t.t+=dT; t.pos=add(A,mul(d,t.t)); rem=0;
+          }
+        }
+        // arrived -> robot processing
+        if (t.seg>=conveyorPath.length-1 && !robot.processing){
+          t.state="ROBOT_PROCESSING";
+          robot.processing=t.id; robot.timer=robot.processTime;
+        }
+      }
+    }
+    if (robot.processing){
+      robot.timer -= dt;
+      if (robot.timer<=0){
+        const t = totes.find(x=>x.id===robot.processing);
+        if (t){
+          t.state="AT_ROBOT_OUTPUT";
+          t.pos={...robot.output};
+          t.seg=0; t.t=0;
+        }
+        robot.processing=null;
+      }
+    }
+
+    // agv update
+    for (let i=0;i<agvs.length;i++){
+      const a=agvs[i];
+      let desired={x:0,y:0};
+
+      if (a.mode==="manual" && i===active){
+        const up=keys["w"]||keys["arrowup"];
+        const dn=keys["s"]||keys["arrowdown"];
+        const lf=keys["a"]||keys["arrowleft"];
+        const rt=keys["d"]||keys["arrowright"];
+        desired.x=(rt?1:0)-(lf?1:0);
+        desired.y=(dn?1:0)-(up?1:0);
+        if (desired.x||desired.y) desired=norm(desired);
+      } else {
+        // auto: seek tote -> deliver infeed
+        const infeedC={x:zones.infeed.x+zones.infeed.w/2,y:zones.infeed.y+zones.infeed.h/2};
+
+        if (!a.carry){
+          // pick nearest (prefer robot output)
+          let best=null, bestScore=Infinity;
+          for (const t of totes){
+            if (t.state!=="AT_ROBOT_OUTPUT" && t.state!=="FLOOR") continue;
+            const score=(t.state==="AT_ROBOT_OUTPUT"?0:5000)+dist2(a.pos,t.pos);
+            if (score<bestScore){bestScore=score; best=t;}
+          }
+          if (best){
+            desired = norm(sub(best.pos, a.pos));
+            if (dist2(a.pos,best.pos)<45*45){
+              best.state="CARRIED"; best.carriedBy=a.id; a.carry=best.id;
+            }
+          }
+        } else {
+          desired = norm(sub(infeedC, a.pos));
+          if (inRect(a.pos, zones.infeed)){
+            const t = totes.find(x=>x.id===a.carry);
+            if (t){
+              t.state="ON_CONVEYOR"; t.carriedBy=null; t.seg=0; t.t=0; t.pos={...conveyorPath[0]};
+            }
+            a.carry=null;
+          }
+        }
+      }
+
+      // smooth acceleration
+      const desiredVel = mul(desired, maxSpeed);
+      const dv = sub(desiredVel, a.vel);
+      const dvL = len(dv);
+      if (len(desired)>0.001){
+        const maxDv = accel*dt;
+        a.vel = dvL>maxDv ? add(a.vel, mul(dv, maxDv/dvL)) : desiredVel;
+      } else {
+        const vL=len(a.vel);
+        const maxDec=brake*dt;
+        a.vel = vL<=maxDec ? {x:0,y:0} : mul(a.vel, (vL-maxDec)/vL);
+      }
+
+      // move + collide
+      let next = add(a.pos, mul(a.vel, dt));
+
+      for (const r of obstacles){
+        const pushed = circleRectPush(next, agvR, r);
+        if (pushed.n){
+          next = pushed.p;
+          const vn = a.vel.x*pushed.n.x + a.vel.y*pushed.n.y;
+          if (vn<0) a.vel = sub(a.vel, mul(pushed.n, vn));
+        }
+      }
+      for (const p of people){
+        const d=sub(next,p.pos); const L=len(d); const minD=agvR+p.r;
+        if (L>1e-6 && L<minD){
+          const n={x:d.x/L,y:d.y/L}; const ov=minD-L;
+          next=add(next,mul(n,ov));
+          const vn=a.vel.x*n.x+a.vel.y*n.y;
+          if (vn<0) a.vel=sub(a.vel,mul(n,vn));
+        }
+      }
+      next.x=clamp(next.x,20,W-20); next.y=clamp(next.y,20,H-20);
+      a.pos=next;
+
+      // smooth rotation
+      const vL=len(a.vel);
+      if (vL>8){
+        const targetAng=Math.atan2(a.vel.y,a.vel.x);
+        a.angle=approachAngle(a.angle,targetAng,turnRate*dt);
+      }
+    }
+
+    draw();
+    requestAnimationFrame(tick);
+  }
+
+  function drawZone(z, fill, stroke){
+    ctx.fillStyle=fill; ctx.strokeStyle=stroke; ctx.lineWidth=2;
+    ctx.beginPath();
+    const r=12;
+    ctx.moveTo(z.x+r,z.y);
+    ctx.arcTo(z.x+z.w,z.y,z.x+z.w,z.y+z.h,r);
+    ctx.arcTo(z.x+z.w,z.y+z.h,z.x,z.y+z.h,r);
+    ctx.arcTo(z.x,z.y+z.h,z.x,z.y,r);
+    ctx.arcTo(z.x,z.y,z.x+z.w,z.y,r);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle="#222"; ctx.font="12px system-ui,sans-serif";
+    ctx.fillText(z.label,z.x+10,z.y+20);
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle="#fff"; ctx.fillRect(0,0,W,H);
+
+    drawZone(zones.infeed,"rgba(0,140,255,0.10)","#008cff");
+    drawZone(zones.robotOutput,"rgba(255,160,0,0.12)","#ff9a00");
+
+    // conveyor path
+    ctx.lineWidth=18; ctx.lineCap="round"; ctx.strokeStyle="#c9c9c9";
+    ctx.beginPath(); ctx.moveTo(conveyorPath[0].x,conveyorPath[0].y);
+    for(let i=1;i<conveyorPath.length;i++) ctx.lineTo(conveyorPath[i].x,conveyorPath[i].y);
+    ctx.stroke();
+    ctx.lineWidth=4; ctx.strokeStyle="#8a8a8a";
+    ctx.beginPath(); ctx.moveTo(conveyorPath[0].x,conveyorPath[0].y);
+    for(let i=1;i<conveyorPath.length;i++) ctx.lineTo(conveyorPath[i].x,conveyorPath[i].y);
+    ctx.stroke();
+
+    // people
+    for (const p of people){
+      ctx.fillStyle="rgba(255,120,120,.9)";
+      ctx.beginPath(); ctx.arc(p.pos.x,p.pos.y,p.r,0,Math.PI*2); ctx.fill();
+    }
+
+    // totes
+    for (const t of totes){
+      if (toteImg.complete && toteImg.naturalWidth>0){
+        ctx.drawImage(toteImg, t.pos.x-18, t.pos.y-14, 36, 28);
+      } else {
+        ctx.fillStyle="#d9b37c"; ctx.strokeStyle="#8a6a3a"; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.roundRect(t.pos.x-17,t.pos.y-13,34,26,6);
+        ctx.fill(); ctx.stroke();
+      }
+    }
+
+    // agvs
+    for (let i=0;i<agvs.length;i++){
+      const a=agvs[i];
+      // shadow
+      ctx.fillStyle="rgba(0,0,0,.10)";
+      ctx.beginPath(); ctx.ellipse(a.pos.x,a.pos.y+18,26,10,0,0,Math.PI*2); ctx.fill();
+
+      ctx.save();
+      ctx.translate(a.pos.x,a.pos.y);
+      ctx.rotate(a.angle + Math.PI/2); // adjust if sprite faces wrong direction
+      if (agvImg.complete && agvImg.naturalWidth>0){
+        ctx.drawImage(agvImg, -32, -32, 64, 64);
+      } else {
+        ctx.fillStyle="#333"; ctx.beginPath(); ctx.arc(0,0,22,0,Math.PI*2); ctx.fill();
+      }
+      ctx.restore();
+
+      if (i===active){
+        ctx.strokeStyle="rgba(0,140,255,.85)"; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.arc(a.pos.x,a.pos.y,28,0,Math.PI*2); ctx.stroke();
+      }
+    }
+  }
+
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
