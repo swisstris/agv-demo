@@ -3,150 +3,202 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AGV Demo (Single AGV)</title>
+  <title>AGV + Conveyor Loop</title>
   <style>
     html,body{margin:0;height:100%;background:#fff;font-family:system-ui,sans-serif;}
-    .wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;}
-    canvas{width:100%;max-width:980px;height:auto;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,.08);}
-    .hud{position:fixed;left:12px;top:12px;background:rgba(255,255,255,.85);backdrop-filter:blur(6px);
-      border:1px solid rgba(0,0,0,.08);border-radius:10px;padding:8px 10px;font-size:12px;color:#111;}
-    kbd{padding:1px 6px;border:1px solid #ccc;border-bottom-width:2px;border-radius:6px;background:#fafafa;}
+    .wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;}
+    canvas{
+      width:100%;
+      max-width:980px;
+      height:auto;
+      border-radius:12px;
+      box-shadow:0 6px 20px rgba(0,0,0,.08);
+      outline:none;
+      background:#fff;
+    }
+    .hud{
+      position:fixed;left:12px;top:12px;
+      background:rgba(255,255,255,.9);
+      border:1px solid rgba(0,0,0,.08);
+      border-radius:10px;
+      padding:8px 10px;
+      font-size:12px;color:#111;
+      max-width:min(520px, calc(100vw - 24px));
+    }
+    .hud kbd{padding:1px 6px;border:1px solid #ccc;border-bottom-width:2px;border-radius:6px;background:#fafafa;margin-right:3px;}
+    .error{
+      position:fixed;left:12px;bottom:12px;
+      background:rgba(255,240,240,.95);
+      border:1px solid rgba(220,0,0,.25);
+      color:#7a0000;
+      border-radius:10px;
+      padding:8px 10px;
+      font-size:12px;
+      max-width:min(900px, calc(100vw - 24px));
+      display:none;
+      white-space:pre-wrap;
+    }
   </style>
 </head>
 <body>
   <div class="hud">
-    Move: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / Arrows • Pick/Drop: <kbd>E</kbd><br/>
-    Tip: click inside the frame once so it captures keys.
+    Click inside the simulator once to capture keys.<br/>
+    Move: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / Arrow keys • Pick/Drop: <kbd>E</kbd>
   </div>
+  <div id="err" class="error"></div>
 
   <div class="wrap">
-    <canvas id="c" width="960" height="540"></canvas>
+    <canvas id="c" width="960" height="540" tabindex="0"></canvas>
   </div>
 
 <script>
 (() => {
   const canvas = document.getElementById("c");
   const ctx = canvas.getContext("2d");
+  const errBox = document.getElementById("err");
 
-  // --- SPRITE ---
+  // --- Show errors on screen (so you don't get "blank page mystery") ---
+  window.addEventListener("error", (e) => {
+    errBox.style.display = "block";
+    errBox.textContent = "JS Error:\n" + (e.error?.stack || e.message || String(e));
+  });
+
+  // Focus canvas for keyboard input inside iframe
+  canvas.addEventListener("pointerdown", () => canvas.focus());
+
+  // --- Sprites ---
   const agvImg = new Image();
-  agvImg.src = "./agv.png";     // must sit next to this HTML file
-
-  // Optional (if you have it). If not, tote will be drawn as a box.
+  agvImg.src = "./agv.png";        // must be next to agv-sim.html
+  // Optional tote sprite: if missing, we draw a box
   const toteImg = new Image();
   toteImg.src = "./tote.png";
 
-  // --- UTIL ---
+  // --- Helpers ---
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-  const len = (v) => Math.hypot(v.x, v.y);
   const add = (a,b)=>({x:a.x+b.x,y:a.y+b.y});
   const sub = (a,b)=>({x:a.x-b.x,y:a.y-b.y});
   const mul = (a,s)=>({x:a.x*s,y:a.y*s});
+  const len = (v)=>Math.hypot(v.x,v.y);
   const norm = (v)=>{const l=len(v); return l>1e-6?{x:v.x/l,y:v.y/l}:{x:0,y:0};};
-  const dist2=(a,b)=>{const dx=a.x-b.x,dy=a.y-b.y;return dx*dx+dy*dy;};
-  const wrap=(a)=>{while(a>Math.PI)a-=Math.PI*2;while(a<-Math.PI)a+=Math.PI*2;return a;};
+  const dist2=(a,b)=>{const dx=a.x-b.x, dy=a.y-b.y; return dx*dx+dy*dy;};
+  const wrap=(a)=>{while(a>Math.PI)a-=Math.PI*2; while(a<-Math.PI)a+=Math.PI*2; return a;};
   const approachAngle=(a,t,maxStep)=>{let d=wrap(t-a); d=clamp(d,-maxStep,maxStep); return wrap(a+d);};
-  const inRect = (p,r)=> p.x>=r.x && p.x<=r.x+r.w && p.y>=r.y && p.y<=r.y+r.h;
 
-  // Robust circle-vs-rect push (handles "inside" case too -> no sticking)
-  function circleRectPush(pos, r, rect){
-    const rx = rect.x, ry = rect.y, rw = rect.w, rh = rect.h;
+  function roundedRectPath(ctx,x,y,w,h,r){
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr,y);
+    ctx.arcTo(x+w,y, x+w,y+h, rr);
+    ctx.arcTo(x+w,y+h, x,y+h, rr);
+    ctx.arcTo(x,y+h, x,y, rr);
+    ctx.arcTo(x,y, x+w,y, rr);
+    ctx.closePath();
+  }
+
+  function pointInRect(p, r){
+    return p.x>=r.x && p.x<=r.x+r.w && p.y>=r.y && p.y<=r.y+r.h;
+  }
+
+  // Robust circle-vs-rect push (handles inside-case -> prevents sticking)
+  function circleRectResolve(pos, radius, rect){
+    const rx=rect.x, ry=rect.y, rw=rect.w, rh=rect.h;
+
+    // closest point on rect to circle center
     const cx = clamp(pos.x, rx, rx+rw);
     const cy = clamp(pos.y, ry, ry+rh);
-    const dx = pos.x - cx, dy = pos.y - cy;
-    const d = Math.hypot(dx,dy);
 
-    // Outside & not intersecting
-    if (d >= r) return { p: pos };
+    const dx = pos.x - cx;
+    const dy = pos.y - cy;
+    const d  = Math.hypot(dx,dy);
 
-    // If center exactly on/inside rect -> choose nearest side to push out
+    if (d >= radius) return { pos };
+
+    // inside or exactly on edge
     if (d < 1e-6) {
+      // push out towards nearest side
       const left   = Math.abs(pos.x - rx);
       const right  = Math.abs((rx+rw) - pos.x);
       const top    = Math.abs(pos.y - ry);
       const bottom = Math.abs((ry+rh) - pos.y);
-
-      const m = Math.min(left, right, top, bottom);
+      const m = Math.min(left,right,top,bottom);
       let n = {x:0,y:0};
-
       if (m === left)   n = {x:-1,y:0};
       if (m === right)  n = {x: 1,y:0};
       if (m === top)    n = {x:0,y:-1};
       if (m === bottom) n = {x:0,y: 1};
-
-      // push out by radius + tiny epsilon
       const eps = 0.5;
-      return { p: { x: pos.x + n.x*(r+eps), y: pos.y + n.y*(r+eps) }, n };
+      return { pos: { x: pos.x + n.x*(radius+eps), y: pos.y + n.y*(radius+eps) }, normal: n };
     }
 
-    // Normal push-out
-    const overlap = r - d;
+    const overlap = radius - d;
     const nx = dx/d, ny = dy/d;
-    return { p: { x: pos.x + nx*overlap, y: pos.y + ny*overlap }, n: { x:nx, y:ny } };
+    return { pos: { x: pos.x + nx*overlap, y: pos.y + ny*overlap }, normal: {x:nx,y:ny} };
   }
 
-  // --- WORLD ---
+  // --- World (logical coordinates) ---
   const W = canvas.width, H = canvas.height;
 
   const zones = {
-    infeed:      { x: 750, y: 150, w: 130, h: 60,  label: "Infeed" },
-    robotOutput: { x: 150, y: 430, w: 140, h: 44,  label: "Robot output" }
+    infeed:      { x: 740, y: 120, w: 190, h: 90, label: "Infeed" },
+    robotOutput: { x: 110, y: 400, w: 200, h: 70, label: "Robot output" }
   };
 
-  // Collision rectangles (conveyors/cell)
+  // Obstacles (simple collision geometry for conveyors/cell)
   const obstacles = [
-    { x: 120, y: 250, w: 640, h: 34,  label: "Conveyor" },
-    { x: 90,  y: 360, w: 240, h: 120, label: "Robot cell" }
+    { x: 210, y: 285, w: 520, h: 26 },
+    { x: 120, y: 330, w: 260, h: 120 }
   ];
 
-  // Conveyor polyline path: infeed -> robot input
+  // Conveyor path: from infeed to robot input
   const conveyorPath = [
-    { x: 815, y: 180 },
-    { x: 520, y: 180 },
-    { x: 520, y: 265 },
-    { x: 260, y: 265 },
-    { x: 210, y: 390 }
+    { x: 835, y: 165 },
+    { x: 560, y: 165 },
+    { x: 560, y: 285 },
+    { x: 300, y: 285 },
+    { x: 260, y: 355 }
   ];
 
-  // Single AGV (manual)
   const agv = {
-    pos: { x: 520, y: 440 },     // safe spawn (not in a wall)
+    pos: { x: 420, y: 420 },   // safe spawn (not inside obstacles)
     vel: { x: 0, y: 0 },
     angle: 0,
-    carry: null
+    carrying: false
   };
 
-  // Single tote loop
   const tote = {
-    pos: { x: 200, y: 452 },
-    state: "AT_ROBOT_OUTPUT", // FLOOR | CARRIED | ON_CONVEYOR | ROBOT_PROCESSING | AT_ROBOT_OUTPUT
-    carriedBy: null,
+    pos: { x: 210, y: 435 },
+    state: "AT_ROBOT_OUTPUT", // AT_ROBOT_OUTPUT | CARRIED | FLOOR | ON_CONVEYOR | ROBOT_PROCESSING
     seg: 0,
     t: 0
   };
 
-  const robot = { processing: null, timer: 0, processTime: 1.2, output: { x: 200, y: 452 } };
+  const robot = {
+    processing: false,
+    timer: 0,
+    processTime: 1.1,
+    outputPos: { x: 210, y: 435 }
+  };
 
-  // --- INPUT ---
+  // --- Input ---
   const keys = {};
-  window.addEventListener("keydown",(e)=>{
+  canvas.addEventListener("keydown",(e)=>{
     const k = e.key.toLowerCase();
-    keys[k]=true;
-    if (k==="e") action();
+    keys[k] = true;
+    if (k === "e") handleAction();
     if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k)) e.preventDefault();
-  }, { passive:false });
-  window.addEventListener("keyup",(e)=>keys[e.key.toLowerCase()]=false);
+  });
+  canvas.addEventListener("keyup",(e)=> keys[e.key.toLowerCase()] = false);
 
-  function action(){
-    // Drop
-    if (agv.carry) {
+  function handleAction(){
+    // drop
+    if (agv.carrying){
+      agv.carrying = false;
       tote.state = "FLOOR";
-      tote.carriedBy = null;
       tote.pos = add(agv.pos, { x: Math.cos(agv.angle)*34, y: Math.sin(agv.angle)*34 });
-      agv.carry = null;
 
-      // Dropped into infeed -> conveyor
-      if (inRect(tote.pos, zones.infeed)) {
+      // if dropped in infeed -> conveyor
+      const infeed = zones.infeed;
+      if (pointInRect(tote.pos, infeed)) {
         tote.state = "ON_CONVEYOR";
         tote.seg = 0; tote.t = 0;
         tote.pos = { ...conveyorPath[0] };
@@ -154,16 +206,15 @@
       return;
     }
 
-    // Pick
+    // pick
     if (tote.state === "ON_CONVEYOR" || tote.state === "ROBOT_PROCESSING") return;
-    if (dist2(agv.pos, tote.pos) < 60*60) {
+    if (dist2(agv.pos, tote.pos) < 65*65) {
+      agv.carrying = true;
       tote.state = "CARRIED";
-      tote.carriedBy = "agv";
-      agv.carry = "tote";
     }
   }
 
-  // --- SIM FEEL (smooth, not arcade) ---
+  // --- Tuning (smooth, not arcade) ---
   const agvR = 22;
   const maxSpeed = 220;
   const accel = 520;
@@ -172,62 +223,80 @@
   const conveyorSpeed = 140;
 
   let last = performance.now();
-  function tick(now){
-    const dt = Math.min(0.033, (now-last)/1000);
+  function frame(now){
+    const dt = Math.min(0.033, (now - last) / 1000);
     last = now;
 
-    // Conveyor + robot
-    if (tote.state === "CARRIED") {
+    update(dt);
+    draw();
+
+    requestAnimationFrame(frame);
+  }
+
+  function update(dt){
+    // tote follows agv if carried
+    if (agv.carrying) {
       tote.pos = add(agv.pos, { x: Math.cos(agv.angle)*32, y: Math.sin(agv.angle)*32 });
+      tote.state = "CARRIED";
     }
 
+    // conveyor motion
     if (tote.state === "ON_CONVEYOR") {
-      let rem = conveyorSpeed * dt;
-      while (rem > 0 && tote.seg < conveyorPath.length - 1) {
-        const A = conveyorPath[tote.seg], B = conveyorPath[tote.seg+1];
-        const d = sub(B,A);
-        const L = Math.hypot(d.x,d.y);
+      let remaining = conveyorSpeed * dt;
+
+      while (remaining > 0 && tote.seg < conveyorPath.length - 1) {
+        const A = conveyorPath[tote.seg];
+        const B = conveyorPath[tote.seg + 1];
+        const d = sub(B, A);
+        const L = Math.hypot(d.x, d.y);
+        if (L < 1e-6) { tote.seg++; tote.t = 0; continue; }
+
         const left = L * (1 - tote.t);
-        if (rem >= left) {
-          tote.t = 1; tote.pos = { ...B };
-          rem -= left;
-          tote.seg++; tote.t = 0;
+        if (remaining >= left) {
+          tote.t = 1;
+          tote.pos = { ...B };
+          remaining -= left;
+          tote.seg++;
+          tote.t = 0;
         } else {
-          const dT = rem / L;
+          const dT = remaining / L;
           tote.t += dT;
           tote.pos = add(A, mul(d, tote.t));
-          rem = 0;
+          remaining = 0;
         }
       }
-      // Arrived -> robot processing
+
+      // arrived at robot input -> processing
       if (tote.seg >= conveyorPath.length - 1 && !robot.processing) {
         tote.state = "ROBOT_PROCESSING";
-        robot.processing = "tote";
+        robot.processing = true;
         robot.timer = robot.processTime;
       }
     }
 
+    // robot processing -> output tote again
     if (robot.processing) {
       robot.timer -= dt;
       if (robot.timer <= 0) {
+        robot.processing = false;
         tote.state = "AT_ROBOT_OUTPUT";
-        tote.pos = { ...robot.output };
+        tote.pos = { ...robot.outputPos };
         tote.seg = 0; tote.t = 0;
-        robot.processing = null;
       }
     }
 
-    // AGV movement (manual)
+    // AGV movement input
     let desired = { x: 0, y: 0 };
     const up = keys["w"] || keys["arrowup"];
     const dn = keys["s"] || keys["arrowdown"];
     const lf = keys["a"] || keys["arrowleft"];
     const rt = keys["d"] || keys["arrowright"];
 
-    desired.x = (rt?1:0) - (lf?1:0);
-    desired.y = (dn?1:0) - (up?1:0);
+    desired.x = (rt ? 1 : 0) - (lf ? 1 : 0);
+    desired.y = (dn ? 1 : 0) - (up ? 1 : 0);
     if (desired.x || desired.y) desired = norm(desired);
 
+    // smooth acceleration towards desired velocity
     const desiredVel = mul(desired, maxSpeed);
     const dv = sub(desiredVel, agv.vel);
     const dvL = len(dv);
@@ -236,57 +305,37 @@
       const maxDv = accel * dt;
       agv.vel = dvL > maxDv ? add(agv.vel, mul(dv, maxDv / dvL)) : desiredVel;
     } else {
+      // smooth braking
       const vL = len(agv.vel);
       const maxDec = brake * dt;
       agv.vel = vL <= maxDec ? { x: 0, y: 0 } : mul(agv.vel, (vL - maxDec) / vL);
     }
 
-    // Predict next + resolve collisions (iterate a bit to avoid getting pinned)
+    // move + collision (iterate to avoid getting pinned)
     let next = add(agv.pos, mul(agv.vel, dt));
-
     for (let it = 0; it < 3; it++) {
       for (const r of obstacles) {
-        const pushed = circleRectPush(next, agvR, r);
-        if (pushed.n) {
-          next = pushed.p;
-          const vn = agv.vel.x*pushed.n.x + agv.vel.y*pushed.n.y;
-          if (vn < 0) agv.vel = sub(agv.vel, mul(pushed.n, vn));
+        const res = circleRectResolve(next, agvR, r);
+        if (res.normal) {
+          next = res.pos;
+          // remove velocity component into the wall normal
+          const vn = agv.vel.x * res.normal.x + agv.vel.y * res.normal.y;
+          if (vn < 0) agv.vel = sub(agv.vel, mul(res.normal, vn));
         }
       }
     }
 
-    // Bounds with radius (prevents corner-sticking)
+    // bounds with radius (prevents corner sticking)
     next.x = clamp(next.x, agvR, W - agvR);
     next.y = clamp(next.y, agvR, H - agvR);
-
     agv.pos = next;
 
-    // Smooth rotation toward motion direction
+    // smooth rotation toward movement direction
     const vL = len(agv.vel);
     if (vL > 8) {
       const targetAng = Math.atan2(agv.vel.y, agv.vel.x);
       agv.angle = approachAngle(agv.angle, targetAng, turnRate * dt);
     }
-
-    draw();
-    requestAnimationFrame(tick);
-  }
-
-  function drawZone(z, fill, stroke){
-    ctx.fillStyle = fill;
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    const r = 12;
-    ctx.moveTo(z.x+r, z.y);
-    ctx.arcTo(z.x+z.w, z.y, z.x+z.w, z.y+z.h, r);
-    ctx.arcTo(z.x+z.w, z.y+z.h, z.x, z.y+z.h, r);
-    ctx.arcTo(z.x, z.y+z.h, z.x, z.y, r);
-    ctx.arcTo(z.x, z.y, z.x+z.w, z.y, r);
-    ctx.closePath();
-    ctx.fill(); ctx.stroke();
-    ctx.fillStyle="#222"; ctx.font="12px system-ui,sans-serif";
-    ctx.fillText(z.label, z.x+10, z.y+20);
   }
 
   function draw(){
@@ -294,27 +343,35 @@
     ctx.fillStyle="#fff";
     ctx.fillRect(0,0,W,H);
 
-    drawZone(zones.infeed,"rgba(0,140,255,0.10)","#008cff");
-    drawZone(zones.robotOutput,"rgba(255,160,0,0.12)","#ff9a00");
+    // zones
+    drawZone(zones.infeed, "rgba(0,140,255,0.10)", "#008cff");
+    drawZone(zones.robotOutput, "rgba(255,160,0,0.12)", "#ff9a00");
 
-    // Conveyor path (visual)
-    ctx.lineWidth = 18; ctx.lineCap="round"; ctx.strokeStyle="#c9c9c9";
-    ctx.beginPath(); ctx.moveTo(conveyorPath[0].x, conveyorPath[0].y);
+    // conveyor path
+    ctx.lineWidth = 18;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "#c9c9c9";
+    ctx.beginPath();
+    ctx.moveTo(conveyorPath[0].x, conveyorPath[0].y);
     for (let i=1;i<conveyorPath.length;i++) ctx.lineTo(conveyorPath[i].x, conveyorPath[i].y);
     ctx.stroke();
-    ctx.lineWidth = 4; ctx.strokeStyle="#8a8a8a";
-    ctx.beginPath(); ctx.moveTo(conveyorPath[0].x, conveyorPath[0].y);
+
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "#8a8a8a";
+    ctx.beginPath();
+    ctx.moveTo(conveyorPath[0].x, conveyorPath[0].y);
     for (let i=1;i<conveyorPath.length;i++) ctx.lineTo(conveyorPath[i].x, conveyorPath[i].y);
     ctx.stroke();
 
-    // Tote
+    // tote
     if (toteImg.complete && toteImg.naturalWidth > 0) {
       ctx.drawImage(toteImg, tote.pos.x-18, tote.pos.y-14, 36, 28);
     } else {
-      ctx.fillStyle="#d9b37c"; ctx.strokeStyle="#8a6a3a"; ctx.lineWidth=2;
-      ctx.beginPath();
-      ctx.roundRect(tote.pos.x-17, tote.pos.y-13, 34, 26, 6);
-      ctx.fill(); ctx.stroke();
+      ctx.fillStyle="#d9b37c";
+      ctx.strokeStyle="#8a6a3a";
+      ctx.lineWidth=2;
+      ctx.fillRect(tote.pos.x-17, tote.pos.y-13, 34, 26);
+      ctx.strokeRect(tote.pos.x-17, tote.pos.y-13, 34, 26);
     }
 
     // AGV shadow
@@ -323,19 +380,38 @@
     ctx.ellipse(agv.pos.x, agv.pos.y+18, 26, 10, 0, 0, Math.PI*2);
     ctx.fill();
 
-    // AGV sprite
+    // AGV sprite (fallback if image missing)
     ctx.save();
     ctx.translate(agv.pos.x, agv.pos.y);
-    ctx.rotate(agv.angle + Math.PI/2); // adjust if facing wrong way
+    ctx.rotate(agv.angle + Math.PI/2); // rotate if your sprite faces a different direction
     if (agvImg.complete && agvImg.naturalWidth > 0) {
       ctx.drawImage(agvImg, -32, -32, 64, 64);
     } else {
-      ctx.fillStyle="#333"; ctx.beginPath(); ctx.arc(0,0,22,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle="#333";
+      ctx.beginPath();
+      ctx.arc(0,0,22,0,Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle="#111";
+      ctx.font="12px system-ui,sans-serif";
+      ctx.fillText("Missing agv.png", -46, -30);
     }
     ctx.restore();
   }
 
-  requestAnimationFrame(tick);
+  function drawZone(z, fill, stroke){
+    ctx.fillStyle = fill;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2;
+    roundedRectPath(ctx, z.x, z.y, z.w, z.h, 14);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#222";
+    ctx.font = "12px system-ui,sans-serif";
+    ctx.fillText(z.label, z.x + 10, z.y + 20);
+  }
+
+  // Start loop
+  requestAnimationFrame(frame);
 })();
 </script>
 </body>
